@@ -13,5 +13,4 @@ class AccountPayment(models.Model):
             invoices = self.env["account.move"].search(
                 [("id", "in", active_ids), ("selected_for_payment", "=", True)]
             )
-            invoices.write({"selected_for_payment": False})
-        return super().action_register_payment()
+        return invoices.write({"selected_for_payment": False})
