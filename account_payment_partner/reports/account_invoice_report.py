@@ -4,6 +4,7 @@
 from odoo import fields, models
 
 
+
 class AccountInvoiceReport(models.Model):
     _inherit = "account.invoice.report"
 
@@ -15,4 +16,4 @@ class AccountInvoiceReport(models.Model):
 
     def _select(self):
         select_str = super()._select()
-        return "%s, move.payment_mode_id AS payment_mode_id" % select_str
+        return self.env._("%s, move.payment_mode_id AS payment_mode_id") % select_str
