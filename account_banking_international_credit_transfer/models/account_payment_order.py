@@ -1,20 +1,24 @@
 # Copyright 2010-2020 Akretion (www.akretion.com)
 # Copyright 2014-2022 Tecnativa - Pedro M. Baeza
+# Copyright 2025 Camptocamp SA
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
 
 from lxml import etree
 
 from odoo import _, fields, models
 from odoo.exceptions import UserError
+from odoo.tools.xml_utils import create_xml_node_chain
 
 
 class AccountPaymentOrder(models.Model):
     _inherit = "account.payment.order"
 
     def generate_payment_file(self):  # noqa: C901
-        """Creates the SEPA Credit Transfer file. That's the important code!"""
+        """Creates the International Transfer file. That's the important code!"""
+        # Code very similar to https://github.com/OCA/bank-payment/blob/17.0/account_banking_sepa_credit_transfer/models/account_payment_order.py#L14
+        # but with intermediary bank support
         self.ensure_one()
-        if self.payment_method_id.code != "sepa_credit_transfer":
+        if self.payment_method_id.code != "international_credit_transfer":
             return super().generate_payment_file()
 
         pain_flavor = self.payment_method_id.pain_version
@@ -22,11 +26,7 @@ class AccountPaymentOrder(models.Model):
         # to support country-specific extensions such as
         # pain.001.001.03.ch.02 (cf l10n_ch_sepa)
         if not pain_flavor:
-            raise UserError(_("PAIN version '%s' is not supported.") % pain_flavor)
-        if pain_flavor.startswith("pain.001.001.02"):
-            bic_xml_tag = "BIC"
-            name_maxsize = 70
-            root_xml_tag = "pain.001.001.02"
+            raise UserError(_("PAIN version must be set on the payment method."))
         elif pain_flavor.startswith("pain.001.001.03"):
             bic_xml_tag = "BIC"
             # size 70 -> 140 for <Nm> with pain.001.001.03
@@ -39,23 +39,14 @@ class AccountPaymentOrder(models.Model):
             # and we put 70 and not 140
             name_maxsize = 70
             root_xml_tag = "CstmrCdtTrfInitn"
-        elif pain_flavor.startswith("pain.001.001.04"):
-            bic_xml_tag = "BICFI"
-            name_maxsize = 140
-            root_xml_tag = "CstmrCdtTrfInitn"
-        elif pain_flavor.startswith("pain.001.001.05"):
-            bic_xml_tag = "BICFI"
-            name_maxsize = 140
-            root_xml_tag = "CstmrCdtTrfInitn"
-        # added pain.001.003.03 for German Banks
-        # it is not in the offical ISO 20022 documentations, but nearly all
-        # german banks are working with this instead 001.001.03
-        elif pain_flavor == "pain.001.003.03":
-            bic_xml_tag = "BIC"
-            name_maxsize = 70
-            root_xml_tag = "CstmrCdtTrfInitn"
         else:
-            raise UserError(_("PAIN version '%s' is not supported.") % pain_flavor)
+            raise UserError(
+                _(
+                    "PAIN version '%s' is not supported for international credit "
+                    "transfers.",
+                    pain_flavor,
+                )
+            )
         xsd_file = self.payment_method_id.get_xsd_file_path()
         gen_args = {
             "bic_xml_tag": bic_xml_tag,
@@ -172,21 +163,43 @@ class AccountPaymentOrder(models.Model):
                 instructed_amount.text = "%.2f" % line.amount
                 amount_control_sum_a += line.amount
                 amount_control_sum_b += line.amount
-                if not line.partner_bank_id:
+                if not (line_partner_bank := line.partner_bank_id):
                     raise UserError(
                         _(
                             "Bank account is missing on the bank payment line "
-                            "of partner '{partner}' (reference '{reference}')."
-                        ).format(partner=line.partner_id.name, reference=line.name)
+                            "of partner '%(partner)s' (reference '%(reference)s').",
+                            partner=line.partner_id.name,
+                            reference=line.name,
+                        )
                     )
-
+                # Intermediary bank, specific to international credit transfers
+                if not (intermediary_bank := line_partner_bank.intermediary_bank_id):
+                    raise UserError(
+                        _(
+                            "Intermediary bank is missing on the recipient bank "
+                            "account of partner '%(partner)s' "
+                            "(reference '%(reference)s').",
+                            partner=line.partner_id.name,
+                            reference=line.name,
+                        )
+                    )
+                financial_institution = create_xml_node_chain(
+                    credit_transfer_transaction_info, ["IntrmyAgt1", "FinInstnId"]
+                )[-1]
+                intermediary_bic = etree.SubElement(financial_institution, bic_xml_tag)
+                intermediary_bic.text = intermediary_bank.bic
+                intermediary_name = etree.SubElement(financial_institution, "Nm")
+                intermediary_name.text = intermediary_bank.name[:name_maxsize]
                 self.generate_party_block(
                     credit_transfer_transaction_info,
                     "Cdtr",
                     "C",
-                    line.partner_bank_id,
+                    line_partner_bank,
                     gen_args,
                     line,
+                    bank_name=line_partner_bank.bank_id.name
+                    if line_partner_bank.bank_id
+                    else None,
                 )
                 line_purpose = line.payment_line_ids[:1].purpose
                 if line_purpose:
@@ -195,13 +208,9 @@ class AccountPaymentOrder(models.Model):
                 self.generate_remittance_info_block(
                     credit_transfer_transaction_info, line, gen_args
                 )
-            if not pain_flavor.startswith("pain.001.001.02"):
+
                 nb_of_transactions_b.text = str(transactions_count_b)
                 control_sum_b.text = "%.2f" % amount_control_sum_b
-        if not pain_flavor.startswith("pain.001.001.02"):
-            nb_of_transactions_a.text = str(transactions_count_a)
-            control_sum_a.text = "%.2f" % amount_control_sum_a
-        else:
             nb_of_transactions_a.text = str(transactions_count_a)
             control_sum_a.text = "%.2f" % amount_control_sum_a
         return self.finalize_pain_file_creation(xml_root, gen_args)
